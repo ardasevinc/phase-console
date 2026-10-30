@@ -5,9 +5,20 @@ import multiprocessing
 from multiprocessing.connection import wait
 import os
 import sys
+import time
 from django_rq.management.commands.rqworker import Command as OriginalRQWorkerCommand
 
 logger = logging.getLogger(__name__)
+
+
+def _wait_for_child_exit(processes):
+    while True:
+        # RQ pools fork again. A grandchild can inherit the pipe behind its
+        # parent's sentinel, keeping it unreadable after that parent dies.
+        wait([process.sentinel for process in processes], timeout=0.5)
+        dead = next((process for process in processes if not process.is_alive()), None)
+        if dead is not None:
+            return dead
 
 
 class Command(BaseCommand):
@@ -177,12 +188,11 @@ class Command(BaseCommand):
         # any child's sentinel fires; exiting non-zero lets the container
         # restart policy bring the whole pool back up cleanly.
         try:
-            wait([process.sentinel for process in processes])
+            dead = _wait_for_child_exit(processes)
         except KeyboardInterrupt:
             self._shutdown(processes)
             return
 
-        dead = next((p for p in processes if not p.is_alive()), None)
         self.stderr.write(
             self.style.ERROR(
                 f"{dead.name if dead else 'a worker process'} exited unexpectedly "
@@ -190,8 +200,37 @@ class Command(BaseCommand):
                 "worker pool for a clean restart"
             )
         )
-        self._shutdown(processes)
+        if not self._shutdown_after_failure(processes):
+            # Do not let multiprocessing's exit handler join a surviving
+            # child forever. Container teardown reaps orphan descendants.
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            finally:
+                os._exit(1)
         sys.exit(1)
+
+    def _shutdown_after_failure(self, processes, grace_seconds=10):
+        """Bound fault recovery only; normal SIGINT keeps its graceful path."""
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+        deadline = time.monotonic() + grace_seconds
+        while any(process.is_alive() for process in processes):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+        deadline = time.monotonic() + 2
+        while any(process.is_alive() for process in processes):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        # is_alive() reaps with waitpid, unlike join(timeout), which can
+        # wait on an inherited sentinel pipe even after the child is dead.
+        return True
 
     def _shutdown(self, processes):
         for process in processes:
